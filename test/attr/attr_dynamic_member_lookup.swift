@@ -135,6 +135,119 @@ func testIUOResult(x: IUOResult) {
 }
 
 //===----------------------------------------------------------------------===//
+// Taking multiple arguments
+//===----------------------------------------------------------------------===//
+
+// Parameters after the initial `dynamicMember:` are valid as long as they
+// have default arguments or are variadic. These can be concrete or generic.
+
+protocol MultiArgDefaultValue {
+  static var defaultValue: Self { get }
+}
+
+@dynamicMemberLookup
+struct ValidMultiArg1 {
+  subscript<T, U, V: MultiArgDefaultValue>(
+    dynamicMember member: KeyPath<T, U>,
+    magic: StaticString = #function,
+    generic: V = .defaultValue,
+    variadic: KeyPath<V, V>...
+  ) -> KeyPath<T, U> {
+    get { member }
+    set {}
+  }
+}
+
+@dynamicMemberLookup
+struct ValidMultiArg2 {
+  subscript<T, U, V: MultiArgDefaultValue>(
+    dynamicMember member: WritableKeyPath<T, U>,
+    magic: StaticString = #function,
+    generic: V = .defaultValue,
+    variadic: KeyPath<V, V>...
+  ) -> WritableKeyPath<T, U> {
+    get { member }
+    set {}
+  }
+}
+
+@dynamicMemberLookup
+struct ValidMultiArg3 {
+  subscript<T, U, V: MultiArgDefaultValue>(
+    dynamicMember member: ReferenceWritableKeyPath<T, U>,
+    magic: StaticString = #function,
+    generic: V = .defaultValue,
+    variadic: KeyPath<V, V>...
+  ) -> WritableKeyPath<T, U> {
+    get { member }
+    set {}
+  }
+}
+
+@dynamicMemberLookup
+struct ValidMultiArg4 {
+  subscript<V: MultiArgDefaultValue>(
+    dynamicMember member: String,
+    magic: StaticString = #function,
+    generic: V = .defaultValue,
+    variadic: KeyPath<V, V>...
+  ) -> String {
+    get { member }
+    set {}
+  }
+}
+
+// Simultaneous overloads don't introduce ambiguity
+
+@dynamicMemberLookup
+struct ValidMultiArg5 {
+  subscript(dynamicMember member: StaticString) -> Int {
+    get { return 42 }
+    set {}
+  }
+
+  subscript<T, U, V: MultiArgDefaultValue>(
+    dynamicMember member: KeyPath<T, U>,
+    magic: StaticString = #function,
+    generic: V = .defaultValue,
+    variadic: KeyPath<V, V>...
+  ) -> KeyPath<T, U> {
+    get { member }
+    set {}
+  }
+
+  subscript<T, U, V: MultiArgDefaultValue>(
+    dynamicMember member: WritableKeyPath<T, U>,
+    magic: StaticString = #function,
+    generic: V = .defaultValue,
+    variadic: KeyPath<V, V>...
+  ) -> WritableKeyPath<T, U> {
+    get { member }
+    set {}
+  }
+
+  subscript<T, U, V: MultiArgDefaultValue>(
+    dynamicMember member: ReferenceWritableKeyPath<T, U>,
+    magic: StaticString = #function,
+    generic: V = .defaultValue,
+    variadic: KeyPath<V, V>...
+  ) -> WritableKeyPath<T, U> {
+    get { member }
+    set {}
+  }
+
+  subscript<V: MultiArgDefaultValue>(
+    dynamicMember member: String,
+    magic: StaticString = #function,
+    generic: V = .defaultValue,
+    variadic: KeyPath<V, V>...
+  ) -> String {
+    get { member }
+    set {}
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // Error cases
 //===----------------------------------------------------------------------===//
 
@@ -156,6 +269,25 @@ struct Invalid2 {
   }
 }
 
+// Given multiple arguments, all values after `dynamicMember:` must have a
+// default value.
+@dynamicMemberLookup
+struct InvalidMultiArg1 {
+  // expected-error@+1{{'@dynamicMemberLookup' requires 'InvalidMultiArg1' to have a 'subscript(dynamicMember:)' method that accepts either 'ExpressibleByStringLiteral' or a key path}}
+  subscript(dynamicMember member: String, magic: StaticString) -> String {
+    member
+  }
+}
+
+// `dynamicMember:` must still be the first argument among multiple.
+@dynamicMemberLookup
+struct InvalidMultiArg2 {
+  // expected-error@+1{{'@dynamicMemberLookup' requires 'InvalidMultiArg2' to have a 'subscript(dynamicMember:)' method that accepts either 'ExpressibleByStringLiteral' or a key path}}
+  subscript(magic: StaticString = #function, dynamicMember member: String) -> String {
+    member
+  }
+}
+
 // References to overloads are resolved just like normal subscript lookup:
 // they are either contextually disambiguated or are invalid.
 @dynamicMemberLookup
@@ -172,6 +304,81 @@ func testAmbiguity(a: Ambiguity) {
   let _: Int = a.flexibility
   let _: Float = a.dynamism
   _ = a.dynamism // expected-error {{ambiguous use of 'subscript(dynamicMember:)'}}
+}
+
+// References to overloads are also resolved just like normal subscript and
+// function lookup in the presence of overloads with default arguments: they are
+// either contextually disambiguated or are invalid, with a preference for
+// overloads with fewer arguments.
+@dynamicMemberLookup
+struct MultiArgAmbiguity {
+  subscript(dynamicMember member: String) -> String {
+    member
+  }
+
+  subscript(dynamicMember member: String, magic: StaticString = #function, variadic: Any...) -> Int {
+    42
+  }
+
+  subscript<V: MultiArgDefaultValue>(dynamicMember member: String, generic: V = .defaultValue, variadic: Any...) -> V {
+    generic
+  }
+
+  subscript(dynamicMember member: String, magic: StaticString = #function) -> Float {
+    42.0
+  }
+
+  subscript(dynamicMember member: String, magic: StaticString = #function) -> Double {
+    42.0
+  }
+
+  subscript<T, U>(dynamicMember member: KeyPath<T, U>, magic: StaticString = #function, variadic: Any...) -> KeyPath<T, U> {
+    member
+  }
+
+  subscript<T, U>(dynamicMember member: WritableKeyPath<T, U>, magic: StaticString = #function, variadic: Any...) -> WritableKeyPath<T, U> {
+    member
+  }
+
+  subscript<T, U>(dynamicMember member: ReferenceWritableKeyPath<T, U>, magic: StaticString = #function, variadic: Any...) -> ReferenceWritableKeyPath<T, U> {
+    member
+  }
+
+  subscript(dynamicMember member: String, magic: StaticString = #function, variadic: Any...) -> String {
+    member
+  }
+}
+
+extension Int: MultiArgDefaultValue {
+  static var defaultValue: Int { 0 }
+}
+
+func testMultiArgAmbiguity(a: MultiArgAmbiguity) {
+  // `subscript(dynamicMember: String) -> String` is preferred over other
+  // overloads as it has fewer parameters; even though the other subscripts can
+  // be ambiguous.
+  let _ = a.foo
+
+  // This is also true when selecting between specific overloads by return type:
+  // `subscript(dynamicMember:) -> String` is preferred over
+  // `subscript<V>(dynamicMember:magic:variadic:) -> String`.
+  let _: String = a.foo
+
+  // Normal disambiguation rules also apply to multi-arg subscripts:
+  // `subscript(dynamicMember:magic:variadic:) -> Int` is preferred over
+  // `subscript<V>(dynamicMember:generic:varadic:) -> V` because it's more
+  // specific.
+  let _: Int = a.foo
+
+  // Other normal ambiguity rules still apply too.
+  let _: Float = a.foo
+  let _: Double = a.foo
+  let _: any BinaryFloatingPoint = a.foo // expected-error{{ambiguous use of 'subscript(dynamicMember:_:)'}}
+
+  class Cls { var foo: Int = 42 }
+  let _: KeyPath<Cls, _> = a.foo
+  let _: WritableKeyPath<Cls, _> = a.foo
+  let _: ReferenceWritableKeyPath<Cls, _> = a.foo
 }
 
 // expected-error @+1 {{'@dynamicMemberLookup' attribute cannot be applied to this declaration}}
@@ -301,6 +508,12 @@ class BaseClass {
   subscript(dynamicMember member: String) -> Int {
     return 42
   }
+
+  // This overload is disfavored at callsites compared to the above and
+  // shouldn't introduce ambiguity.
+  subscript(dynamicMember member: String, magic: StaticString = #function) -> Int {
+    return 42
+  }
 }
 class DerivedClass : BaseClass {}
 
@@ -332,6 +545,13 @@ struct SettableGeneric1<T> {
     get {}
     nonmutating set {}
   }
+
+  // This overload is disfavored at callsites compared to the above and
+  // shouldn't introduce ambiguity.
+  subscript(dynamicMember member: StaticString, variadic: T...) -> T? {
+    get {}
+    nonmutating set {}
+  }
 }
 
 func testGenericType<T>(a: SettableGeneric1<T>, b: T) -> T? {
@@ -347,6 +567,13 @@ func testConcreteGenericType(a: SettableGeneric1<Int>) -> Int? {
 @dynamicMemberLookup
 struct SettableGeneric2<T> {
   subscript<U: ExpressibleByStringLiteral>(dynamicMember member: U) -> T {
+    get {}
+    nonmutating set {}
+  }
+
+  // This overload is disfavored at callsites compared to the above and
+  // shouldn't introduce ambiguity.
+  subscript<U: ExpressibleByStringLiteral>(dynamicMember member: U, variadic: U...) -> T {
     get {}
     nonmutating set {}
   }
@@ -396,8 +623,17 @@ func testGenerics<S, T, P: GenericProtocol>(
 @dynamicMemberLookup
 class KP {
   subscript(dynamicMember member: String) -> Int { return 7 }
+
+  // This overload is disfavored at callsites compared to the above and
+  // shouldn't introduce ambiguity.
+  //
+  // We're using `String` here instead of `StaticString` since a `KeyPath`
+  // reference below requires arguments to be `Hashable` and `StaticString`
+  // isn't.
+  subscript(dynamicMember member: String, magic: String = #function) -> Int { return 42 }
 }
 _ = \KP.[dynamicMember: "hi"]
+_ = \KP.[dynamicMember: "hi", #fileID]
 _ = \KP.testLookup
 
 /* KeyPath based dynamic lookup */
@@ -426,6 +662,17 @@ struct Lens<T> {
   }
 
   subscript<U>(dynamicMember member: WritableKeyPath<T, U>) -> Lens<U> {
+    get { return Lens<U>(obj[keyPath: member]) }
+    set { obj[keyPath: member] = newValue.obj }
+  }
+
+  // These overloads are disfavored at callsites compared to the above and
+  // shouldn't introduce ambiguity.
+  subscript<U>(dynamicMember member: KeyPath<T, U>, magic: StaticString = #function) -> Lens<U> {
+    get { return Lens<U>(obj[keyPath: member]) }
+  }
+
+  subscript<U>(dynamicMember member: WritableKeyPath<T, U>, magic: StaticString = #function) -> Lens<U> {
     get { return Lens<U>(obj[keyPath: member]) }
     set { obj[keyPath: member] = newValue.obj }
   }
@@ -538,6 +785,12 @@ class AMetatype<T> {
   subscript<U>(dynamicMember member: KeyPath<T.Type, U>) -> U {
     get { return value[keyPath: member] }
   }
+
+  // This overload is disfavored at callsites compared to the above and
+  // shouldn't introduce ambiguity.
+  subscript<U>(dynamicMember member: KeyPath<T.Type, U>, magic: StaticString = #function) -> U {
+    get { return value[keyPath: member] }
+  }
 }
 
 // Let's make sure that keypath dynamic member lookup
@@ -567,6 +820,12 @@ extension KeyPathLookup {
   subscript(dynamicMember member: KeyPath<T, Int>) -> Int! {
     get { return value[keyPath: member] }
   }
+
+  // This overload is disfavored at callsites compared to the above and
+  // shouldn't introduce ambiguity.
+  subscript(dynamicMember member: KeyPath<T, Int>, magic: StaticString = #function) -> Int! {
+    get { return value[keyPath: member] }
+  }
 }
 
 class C<T> : KeyPathLookup {
@@ -592,6 +851,12 @@ class D<T> {
   }
 
   subscript<U: Numeric>(dynamicMember member: KeyPath<T, U>) -> (U) -> U {
+    get { return { offset in self.value[keyPath: member] + offset } }
+  }
+
+  // This overload is disfavored at callsites compared to the above and
+  // shouldn't introduce ambiguity.
+  subscript<U: Numeric>(dynamicMember member: KeyPath<T, U>, magic: StaticString = #function) -> (U) -> U {
     get { return { offset in self.value[keyPath: member] + offset } }
   }
 }
@@ -623,6 +888,26 @@ struct SubscriptLens<T> {
   }
 
   subscript<U>(dynamicMember member: WritableKeyPath<T, U>) -> U {
+    get { return value[keyPath: member] }
+    set { value[keyPath: member] = newValue }
+  }
+
+  // These overloads are disfavored at callsites compared to the above and
+  // shouldn't introduce ambiguity.
+  subscript(foo: String, magic: StaticString = #function) -> Int {
+    get { return 42 }
+  }
+
+  subscript(offset: Int, magic: StaticString = #function) -> Int {
+    get { return counter }
+    set { counter = counter + newValue }
+  }
+
+  subscript<U>(dynamicMember member: KeyPath<T, U>, magic: StaticString = #function) -> U! {
+    get { return value[keyPath: member] }
+  }
+
+  subscript<U>(dynamicMember member: WritableKeyPath<T, U>, magic: StaticString = #function) -> U {
     get { return value[keyPath: member] }
     set { value[keyPath: member] = newValue }
   }
@@ -694,6 +979,13 @@ struct SingleChoiceLens<T> {
   }
 
   subscript<U>(dynamicMember member: WritableKeyPath<T, U>) -> U {
+    get { return obj[keyPath: member] }
+    set { obj[keyPath: member] = newValue }
+  }
+
+  // This overload is disfavored at callsites compared to the above and
+  // shouldn't introduce ambiguity.
+  subscript<U>(dynamicMember member: WritableKeyPath<T, U>, magic: StaticString = #function) -> U {
     get { return obj[keyPath: member] }
     set { obj[keyPath: member] = newValue }
   }

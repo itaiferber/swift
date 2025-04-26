@@ -2184,6 +2184,41 @@ namespace {
       return solution.simplifyType(type);
     }
 
+    /// Returns the concrete callee which 'owns' the default argument at a given
+    /// index. This looks through inheritance for inherited default args.
+    ConcreteDeclRef getDefaultArgOwner(ConcreteDeclRef owner, unsigned index) {
+      auto *param = getParameterAt(owner, index);
+      assert(param);
+      if (param->getDefaultArgumentKind() == DefaultArgumentKind::Inherited) {
+        return getDefaultArgOwner(owner.getOverriddenDecl(), index);
+      }
+      return owner;
+    }
+
+    // For variadic generic declarations we need to compute a substituted
+    // version of bindings because all of the packs are exploaded in the
+    // substituted function type.
+    //
+    // \code
+    // func fn<each T>(_: repeat each T) {}
+    //
+    // fn("", 42)
+    // \endcode
+    //
+    // The type of `fn` in the call is `(String, Int) -> Void` but bindings
+    // have only one parameter at index `0` with two argument positions: 0, 1.
+    bool shouldSubstituteParameterBindings(ConcreteDeclRef callee) {
+      auto subst = callee.getSubstitutions();
+      if (subst.empty())
+        return false;
+
+      auto sig = subst.getGenericSignature();
+      return llvm::any_of(sig.getGenericParams(),
+                          [&](const GenericTypeParamType *GP) {
+                            return GP->isParameterPack();
+                          });
+    }
+
   public:
     /// Coerce the given expression to the given type.
     ///
@@ -2367,10 +2402,12 @@ namespace {
                                   ->castTo<FunctionType>();
       auto appliedWrappers =
           solution.getAppliedPropertyWrappers(memberLoc->getAnchor());
+
       args = coerceCallArguments(
           args, fullSubscriptTy, subscriptRef, nullptr,
           locator.withPathElement(ConstraintLocator::ApplyArgument),
           appliedWrappers);
+
       if (!args)
         return nullptr;
 
@@ -2524,7 +2561,7 @@ namespace {
           LocatorPathElt::KeyPathDynamicMember(keyPathTy->getAnyNominal()));
       auto overload = solution.getOverloadChoice(componentLoc);
 
-      // Looks like there is a chain of implicit `subscript(dynamicMember:)`
+      // Looks like there is a chain of implicit `subscript(dynamicMember:...)`
       // calls necessary to resolve a member reference.
       switch (overload.choice.getKind()) {
       case OverloadChoiceKind::DynamicMemberLookup:
@@ -3594,6 +3631,60 @@ namespace {
       llvm_unreachable("Unhandled OverloadChoiceKind in switch.");
     }
 
+    /// Builds an argument list for making a call to the given
+    /// `@dynamicMemberLookup` subscript by inserting any necessary default
+    /// arguments.
+    ArgumentList *buildArgumentListForDynamicMemberLookupSubscript(
+        const SelectedOverload &overload, SourceLoc componentLoc,
+        ConstraintLocator *locator) {
+      assert(overload.choice.isAnyDynamicMemberLookup() &&
+             "Overload must be for dynamic member lookup");
+      auto *SD = cast<SubscriptDecl>(overload.choice.getDecl());
+      auto memberLoc = cs.getCalleeLocator(locator);
+      auto subscript = resolveConcreteDeclRef(SD, memberLoc);
+
+      auto openedFullFnTy =
+          simplifyType(overload.adjustedOpenedFullType)->castTo<FunctionType>();
+      auto fullSubscriptTy =
+          openedFullFnTy->getResult()->castTo<FunctionType>();
+      auto params = fullSubscriptTy->getParams();
+
+      SmallVector<Expr *, 4> args;
+      for (auto paramIdx : indices(params)) {
+        Expr *argExpr;
+        if (paramIdx == 0) {
+          auto paramTy = params[paramIdx].getPlainType();
+          if (overload.choice.isKeyPathDynamicMemberLookup()) {
+            argExpr = buildKeyPathDynamicMemberArgExpr(paramTy, componentLoc,
+                                                       memberLoc);
+          } else {
+            auto fieldName =
+                overload.choice.getName().getBaseIdentifier().str();
+            argExpr = buildDynamicMemberLookupArgExpr(fieldName, componentLoc,
+                                                      paramTy);
+          }
+        } else {
+          // If bindings were substituted, we need to find the "original" (or
+          // contextless) parameter index for the default argument.
+          if (shouldSubstituteParameterBindings(subscript)) {
+            auto *paramList = SD->getParameterList();
+            assert(paramList);
+            paramIdx = paramList->getOrigParamIndex(
+                subscript.getSubstitutions(), paramIdx);
+          }
+
+          auto owner = getDefaultArgOwner(subscript, paramIdx);
+          auto paramTy = params[paramIdx].getParameterType();
+          argExpr = new (ctx)
+              DefaultArgumentExpr(owner, paramIdx, SourceLoc(), paramTy, dc);
+        }
+
+        args.push_back(cs.cacheType(argExpr));
+      }
+
+      return ArgumentList::forImplicitCallTo(SD->getIndices(), args, ctx);
+    }
+
     /// Form a type checked expression for the argument of a
     /// @dynamicMemberLookup subscript index parameter.
     Expr *buildDynamicMemberLookupArgExpr(StringRef name, SourceLoc loc,
@@ -3601,6 +3692,7 @@ namespace {
       // Build and type check the string literal index value to the specific
       // string type expected by the subscript.
       auto *nameExpr = new (ctx) StringLiteralExpr(name, loc, /*implicit*/true);
+      nameExpr->setType(literalTy);
       cs.setType(nameExpr, literalTy);
       return handleStringLiteralExpr(nameExpr);
     }
@@ -3610,47 +3702,19 @@ namespace {
                                       const SelectedOverload &overload,
                                       ConstraintLocator *memberLocator) {
       // Application of a DynamicMemberLookup result turns
-      // a member access of `x.foo` into x[dynamicMember: "foo"], or
-      // x[dynamicMember: KeyPath<T, U>]
+      // a member access of `x.foo` into `x[dynamicMember: "foo", ...]`, or
+      // `x[dynamicMember: KeyPath<T, U>, ...]`
+      auto componentLoc =
+          overload.choice.getKind() == OverloadChoiceKind::DynamicMemberLookup
+              ? nameLoc
+              : dotLoc;
+      auto *args = buildArgumentListForDynamicMemberLookupSubscript(
+          overload, componentLoc, memberLocator);
 
-      // Figure out the expected type of the lookup parameter. We know the
-      // openedFullType will be "xType -> indexType -> resultType".  Dig out
-      // its index type.
-      auto paramTy = getTypeOfDynamicMemberIndex(overload);
-
-      Expr *argExpr = nullptr;
-      if (overload.choice.getKind() ==
-          OverloadChoiceKind::DynamicMemberLookup) {
-        // Build and type check the string literal index value to the specific
-        // string type expected by the subscript.
-        auto fieldName = overload.choice.getName().getBaseIdentifier().str();
-        argExpr = buildDynamicMemberLookupArgExpr(fieldName, nameLoc, paramTy);
-      } else {
-        argExpr =
-            buildKeyPathDynamicMemberArgExpr(paramTy, dotLoc, memberLocator);
-      }
-
-      if (!argExpr)
-        return nullptr;
-
-      // Build an argument list.
-      auto *argList =
-          ArgumentList::forImplicitSingle(ctx, ctx.Id_dynamicMember, argExpr);
       // Build and return a subscript that uses this string as the index.
-      return buildSubscript(base, argList, cs.getConstraintLocator(expr),
+      return buildSubscript(base, args, cs.getConstraintLocator(expr),
                             memberLocator, /*isImplicit*/ true,
                             AccessSemantics::Ordinary, overload);
-    }
-
-    Type getTypeOfDynamicMemberIndex(const SelectedOverload &overload) {
-      assert(overload.choice.isAnyDynamicMemberLookup());
-
-      auto declTy = solution.simplifyType(overload.adjustedOpenedFullType);
-      auto subscriptTy = declTy->castTo<FunctionType>()->getResult();
-      auto refFnType = subscriptTy->castTo<FunctionType>();
-      assert(refFnType->getParams().size() == 1 &&
-             "subscript always has one arg");
-      return refFnType->getParams()[0].getPlainType();
     }
 
   public:
@@ -5454,23 +5518,14 @@ namespace {
       // Compute substitutions to refer to the member.
       auto ref = resolveConcreteDeclRef(subscript, memberLoc);
 
-      // If this is a @dynamicMemberLookup reference to resolve a property
-      // through the subscript(dynamicMember:) member, restore the
+      // If this is a `@dynamicMemberLookup` reference to resolve a property
+      // through the `subscript(dynamicMember:...)` member, restore the
       // openedType and origComponent to its full reference as if the user
       // wrote out the subscript manually.
       if (overload.choice.isAnyDynamicMemberLookup()) {
-        auto indexType = getTypeOfDynamicMemberIndex(overload);
-        Expr *argExpr = nullptr;
-        if (overload.choice.isKeyPathDynamicMemberLookup()) {
-          argExpr = buildKeyPathDynamicMemberArgExpr(indexType, componentLoc,
-                                                     memberLoc);
-        } else {
-          auto fieldName = overload.choice.getName().getBaseIdentifier().str();
-          argExpr = buildDynamicMemberLookupArgExpr(fieldName, componentLoc,
-                                                    indexType);
-        }
-        args = ArgumentList::forImplicitSingle(ctx, ctx.Id_dynamicMember,
-                                               argExpr);
+        args = buildArgumentListForDynamicMemberLookupSubscript(
+            overload, componentLoc, locator);
+
         // Record the implicit subscript expr's parameter bindings and matching
         // direction as `coerceCallArguments` requires them.
         solution.recordSingleArgMatchingChoice(locator);
@@ -5757,18 +5812,6 @@ Solution::resolveLocatorToDecl(ConstraintLocator *locator) const {
     return ConcreteDeclRef();
 
   return resolveConcreteDeclRef(overload->choice.getDeclOrNull(), locator);
-}
-
-/// Returns the concrete callee which 'owns' the default argument at a given
-/// index. This looks through inheritance for inherited default args.
-static ConcreteDeclRef getDefaultArgOwner(ConcreteDeclRef owner,
-                                          unsigned index) {
-  auto *param = getParameterAt(owner, index);
-  assert(param);
-  if (param->getDefaultArgumentKind() == DefaultArgumentKind::Inherited) {
-    return getDefaultArgOwner(owner.getOverriddenDecl(), index);
-  }
-  return owner;
 }
 
 static bool canPeepholeTupleConversion(Expr *expr,
@@ -6112,29 +6155,6 @@ static void applyContextualClosureFlags(Expr *expr, bool implicitSelfCapture,
                                 requiresDynamicIsolationChecking,
                                 isMacroArg);
   }
-}
-
-// For variadic generic declarations we need to compute a substituted
-// version of bindings because all of the packs are exploaded in the
-// substituted function type.
-//
-// \code
-// func fn<each T>(_: repeat each T) {}
-//
-// fn("", 42)
-// \endcode
-//
-// The type of `fn` in the call is `(String, Int) -> Void` but bindings
-// have only one parameter at index `0` with two argument positions: 0, 1.
-static bool shouldSubstituteParameterBindings(ConcreteDeclRef callee) {
-  auto subst = callee.getSubstitutions();
-  if (subst.empty())
-    return false;
-
-  auto sig = subst.getGenericSignature();
-  return llvm::any_of(
-      sig.getGenericParams(),
-      [&](const GenericTypeParamType *GP) { return GP->isParameterPack(); });
 }
 
 /// Compute parameter binding substitutions by exploding pack expansions
