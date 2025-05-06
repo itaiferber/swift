@@ -22,6 +22,7 @@
 #include "TypeCheckType.h"
 #include "TypeChecker.h"
 #include "swift/AST/ConformanceLookup.h"
+#include "swift/AST/ExtInfo.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Effects.h"
 #include "swift/AST/MacroDefinition.h"
@@ -1626,6 +1627,13 @@ DeclReferenceType ConstraintSystem::getTypeOfMemberReference(
       if (thrownErrorType) {
         info = info.withThrows(true, thrownErrorType);
         thrownErrorType = Type();
+      }
+
+      // Mark the isolation if any parameter is isolated.
+      if (llvm::any_of(indices, [&](AnyFunctionType::Param p) {
+            return p.isIsolated();
+          })) {
+        info = info.withIsolation(FunctionTypeIsolation::forParameter());
       }
 
       refType = FunctionType::get(indices, elementTy, info);
